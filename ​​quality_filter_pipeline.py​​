@@ -1,0 +1,72 @@
+# 文件名: quality_filter_pipeline.py
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import Tokenizer, HashingTF
+from pyspark.ml.classification import LogisticRegression
+from pyspark.sql.functions import lit, regexp_replace, col
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+import numpy as np
+
+spark = SparkSession.builder \
+    .appName("QualityFilter") \
+    .config("spark.sql.shuffle.partitions", "2000") \
+    .getOrCreate()
+
+# 加载并清洗数据
+pos_data = spark.read.json("s3://high_quality_data/*") \
+    .withColumn("text", regexp_replace("text", "<[^>]+>", "")) \
+    .withColumn("text", regexp_replace("text", "[^a-zA-Z ]", "")) \
+    .withColumn("label", lit(1))
+
+neg_data = spark.read.text("s3://common_crawl_sample/*") \
+    .withColumnRenamed("value", "text") \
+    .withColumn("label", lit(0))
+
+# 平衡数据
+neg_sample = neg_data.orderBy("text").limit(10 * pos_data.count())
+train_data = pos_data.union(neg_sample).cache()
+
+# 构建Pipeline
+tokenizer = Tokenizer(inputCol="text", outputCol="words")
+hashing_tf = HashingTF(inputCol="words", outputCol="features", numFeatures=2**20)
+lr = LogisticRegression(maxIter=100)
+pipeline = Pipeline(stages=[tokenizer, hashing_tf, lr])
+
+# 交叉验证调参
+param_grid = ParamGridBuilder() \
+    .addGrid(lr.regParam, [0.01, 0.1, 1.0]) \
+    .build()
+
+evaluator = BinaryClassificationEvaluator(metricName="areaUnderROC")
+cv = CrossValidator(
+    estimator=pipeline,
+    estimatorParamMaps=param_grid,
+    evaluator=evaluator,
+    numFolds=3
+)
+
+cv_model = cv.fit(train_data)
+best_model = cv_model.bestModel
+
+# 评估模型
+test_data = train_data.sample(0.2)
+predictions = best_model.transform(test_data)
+auc = evaluator.evaluate(predictions)
+print(f"Validation AUC: {auc:.4f}")
+
+# 全量数据过滤
+cc_data = spark.read.text("s3://common_crawl/*").withColumnRenamed("value", "text")
+scored_data = best_model.transform(cc_data)
+
+# 帕累托重采样（优化版）
+alpha = 9
+
+@udf(BooleanType())
+def pareto_filter_udf(score):
+    return np.random.pareto(alpha) > (1 - score)
+
+filtered_data = scored_data.filter(pareto_filter_udf(col("probability")[1]))
+filtered_data.write.parquet("s3://filtered_common_crawl")
+
+spark.stop()
